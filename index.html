@@ -838,36 +838,68 @@
       return true;
     }
 
-    // Короткий трёхсекундный сигнал без внешнего аудиофайла.
-    // Web Audio работает только пока страница активна; для заблокированного экрана
-    // дополнительно используется системное PWA-уведомление ниже.
-    function playTimerSound() {
+    // Звуковой сигнал завершения таймера через Web Audio API с автоматической разблокировкой
+    let globalAudioCtx = null;
+    function getAudioContext() {
       try {
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextClass) return;
-        const ctx = new AudioContextClass();
-        const start = ctx.currentTime;
-        const playBeep = (freq, time, duration) => {
-          const oscillator = ctx.createOscillator();
-          const gain = ctx.createGain();
-          oscillator.connect(gain);
-          gain.connect(ctx.destination);
-          oscillator.type = 'sine';
-          oscillator.frequency.setValueAtTime(freq, time);
-          gain.gain.setValueAtTime(0.0001, time);
-          gain.gain.exponentialRampToValueAtTime(0.28, time + 0.025);
-          gain.gain.exponentialRampToValueAtTime(0.0001, time + duration);
-          oscillator.start(time);
-          oscillator.stop(time + duration + 0.02);
-        };
-        playBeep(880, start, 0.42);
-        playBeep(1174.66, start + 0.52, 0.42);
-        playBeep(880, start + 1.04, 0.42);
-        playBeep(1174.66, start + 1.56, 0.42);
-        playBeep(1318.51, start + 2.08, 0.72);
-        window.setTimeout(() => ctx.close().catch(() => {}), 3400);
-      } catch (error) {
-        // На заблокированном экране сигнал берёт на себя Notification API.
+        if (!AudioContextClass) return null;
+        if (!globalAudioCtx) {
+          globalAudioCtx = new AudioContextClass();
+        }
+        if (globalAudioCtx.state === 'suspended') {
+          globalAudioCtx.resume();
+        }
+        return globalAudioCtx;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Автоматическая разблокировка аудио при первом касании / клике в браузере
+    if (typeof window !== 'undefined') {
+      ['click', 'touchstart', 'touchend', 'keydown'].forEach(evt => {
+        window.addEventListener(evt, () => {
+          try {
+            const ctx = getAudioContext();
+            if (ctx && ctx.state === 'suspended') {
+              ctx.resume();
+            }
+          } catch (e) {}
+        }, { passive: true });
+      });
+    }
+
+    function playTimerSound() {
+      try {
+        const ctx = getAudioContext();
+        if (ctx) {
+          if (ctx.state === 'suspended') {
+            ctx.resume();
+          }
+          const now = ctx.currentTime;
+          const playBeep = (freq, time, dur, volume = 0.35) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(freq, time);
+            gain.gain.setValueAtTime(volume, time);
+            gain.gain.exponentialRampToValueAtTime(0.001, time + dur);
+            osc.start(time);
+            osc.stop(time + dur);
+          };
+          // Тройной звуковой гонг
+          playBeep(880, now, 0.2, 0.4);
+          playBeep(1174.66, now + 0.22, 0.25, 0.45);
+          playBeep(1760, now + 0.50, 0.35, 0.5);
+        }
+        if (typeof navigator !== 'undefined' && navigator.vibrate) {
+          navigator.vibrate([200, 100, 200, 100, 300]);
+        }
+      } catch (e) {
+        console.warn('Audio error:', e);
       }
     }
 
@@ -996,7 +1028,9 @@
         if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
         notifyTimerFinished(exerciseName);
         if (!document.hidden) {
-          alert('⏰ Время отдыха закончилось! Готовы к следующему подходу?');
+          setTimeout(() => {
+            alert('⏰ Время отдыха закончилось! Готовы к следующему подходу?');
+          }, 700);
         }
       };
 
@@ -1037,7 +1071,12 @@
       // Обработка таймера отдыха с сохранением в фоновом режиме и при выходе с сайта
       useEffect(() => {
         let interval;
-        if (restTimer.isRunning) {
+        if (!currentWorkout && restTimer.isRunning) {
+          stopRestTimer();
+          return;
+        }
+
+        if (restTimer.isRunning && currentWorkout) {
           interval = setInterval(() => {
             const now = Date.now();
             const diff = Math.ceil((restTimer.targetTime - now) / 1000);
@@ -1052,11 +1091,11 @@
           }, 500);
 
           const handleVisibility = () => {
-            if (!document.hidden && restTimer.isRunning) {
+            if (!document.hidden && restTimer.isRunning && currentWorkout) {
               const now = Date.now();
               const diff = Math.ceil((restTimer.targetTime - now) / 1000);
               if (diff <= 0) {
-                finishRestTimer(restTimer.targetTime, restTimer.exerciseName);
+              finishRestTimer(restTimer.targetTime, restTimer.exerciseName);
               } else {
                 setRestTimer(prev => ({
                   ...prev,
@@ -1073,7 +1112,7 @@
           };
         }
         return () => clearInterval(interval);
-      }, [restTimer.isRunning, restTimer.targetTime]);
+      }, [restTimer.isRunning, restTimer.targetTime, currentWorkout]);
 
       const startRestTimer = (seconds, exerciseName = '') => {
         const duration = Math.max(5, seconds || userSettings.defaultRestTime || 90);
@@ -1290,9 +1329,16 @@
         if (!currentWorkout) return;
         
         if (confirm('⚠️ Отменить тренировку?\n\nВсе данные текущей тренировки будут потеряны. Вы уверены?')) {
-          setCurrentWorkout(null);
           setIsTimerRunning(false);
           setTimerSeconds(0);
+          timerStartTimeRef.current = null;
+          stopRestTimer();
+          localStorage.removeItem('gym_current_workout');
+          localStorage.removeItem('gym_timer_seconds');
+          localStorage.removeItem('gym_timer_start_time');
+          localStorage.removeItem('gym_rest_running');
+          localStorage.removeItem('gym_rest_target');
+          setCurrentWorkout(null);
           alert('Тренировка отменена');
         }
       };
@@ -1395,6 +1441,13 @@
         
         setIsTimerRunning(false);
         setTimerSeconds(0);
+        timerStartTimeRef.current = null;
+        stopRestTimer();
+        localStorage.removeItem('gym_current_workout');
+        localStorage.removeItem('gym_timer_seconds');
+        localStorage.removeItem('gym_timer_start_time');
+        localStorage.removeItem('gym_rest_running');
+        localStorage.removeItem('gym_rest_target');
         
         setCurrentWorkout(null);
         
@@ -1531,7 +1584,7 @@
               </div>
               
               <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap'}}>
-                {restTimer.isRunning && restTimer.remainingSeconds > 0 && (
+                {currentWorkout && restTimer.isRunning && restTimer.remainingSeconds > 0 && (
                   <div 
                     className="timer-display" 
                     style={{
@@ -1548,7 +1601,7 @@
                     </span>
                   </div>
                 )}
-                {isTimerRunning && (
+                {currentWorkout && isTimerRunning && (
                   <div className="timer-display">
                     <span className="timer-icon">⏱️</span>
                     <span className="timer-text">{formatTime(timerSeconds)}</span>
@@ -1767,6 +1820,29 @@
         });
         setShowExerciseModal(false);
         setExerciseSearchQuery('');
+      };
+
+      const moveExerciseInWorkout = (index, direction) => {
+        const newIndex = index + direction;
+        if (!currentWorkout || newIndex < 0 || newIndex >= currentWorkout.exercises.length) return;
+        const updated = [...currentWorkout.exercises];
+        const [moved] = updated.splice(index, 1);
+        updated.splice(newIndex, 0, moved);
+        onUpdateWorkout({
+          ...currentWorkout,
+          exercises: updated
+        });
+      };
+
+      const deleteExerciseFromWorkout = (exerciseId, exerciseName) => {
+        if (!currentWorkout) return;
+        if (confirm(`Удалить упражнение «${exerciseName}» из текущей тренировки?`)) {
+          const updated = currentWorkout.exercises.filter(e => e.exerciseId !== exerciseId);
+          onUpdateWorkout({
+            ...currentWorkout,
+            exercises: updated
+          });
+        }
       };
 
       const openSetModal = (exerciseId) => {
@@ -2037,7 +2113,7 @@
             ) : (
               <>
                 <div style={{display: 'flex', flexDirection: 'column', gap: '1rem'}}>
-                  {currentWorkout.exercises.map(ex => {
+                  {currentWorkout.exercises.map((ex, exIndex) => {
                     const exDef = exercises.find(e => e.id === ex.exerciseId);
                     const hasWeight = exDef ? checkExerciseHasWeight(exDef) : checkExerciseHasWeight(ex);
                     const prevStats = getPreviousExerciseStats(ex.exerciseId, ex.exerciseName);
@@ -2045,11 +2121,69 @@
                     return (
                       <div key={ex.exerciseId} className="exercise-item">
                         <div style={{marginBottom: '0.5rem'}}>
-                          <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem'}}>
-                            <h4 style={{fontWeight: 600, color: '#0f172a', fontSize: '1.05rem'}}>{ex.exerciseName}</h4>
-                            <span style={{fontSize: '0.75rem', color: hasWeight ? '#2563eb' : '#059669', background: hasWeight ? '#eff6ff' : '#ecfdf5', padding: '0.2rem 0.5rem', borderRadius: '4px', fontWeight: 500}}>
-                              {hasWeight ? 'С весом' : 'Без веса'}
-                            </span>
+                          <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem', flexWrap: 'wrap'}}>
+                            <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem', minWidth: 0, flex: 1}}>
+                              <span style={{fontWeight: 700, color: '#2563eb', fontSize: '0.95rem', minWidth: '22px'}}>{exIndex + 1}.</span>
+                              <h4 style={{fontWeight: 600, color: '#0f172a', fontSize: '1.05rem', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis'}}>{ex.exerciseName}</h4>
+                              <span style={{fontSize: '0.75rem', color: hasWeight ? '#2563eb' : '#059669', background: hasWeight ? '#eff6ff' : '#ecfdf5', padding: '0.2rem 0.5rem', borderRadius: '4px', fontWeight: 500, whiteSpace: 'nowrap'}}>
+                                {hasWeight ? 'С весом' : 'Без веса'}
+                              </span>
+                            </div>
+
+                            {/* Кнопки порядка и удаления упражнения из тренировки */}
+                            <div style={{display: 'flex', alignItems: 'center', gap: '0.25rem', flexShrink: 0}}>
+                              <button
+                                type="button"
+                                onClick={() => moveExerciseInWorkout(exIndex, -1)}
+                                disabled={exIndex === 0}
+                                style={{
+                                  background: '#f1f5f9',
+                                  border: '1px solid #cbd5e1',
+                                  borderRadius: '6px',
+                                  padding: '3px 7px',
+                                  cursor: exIndex === 0 ? 'not-allowed' : 'pointer',
+                                  opacity: exIndex === 0 ? 0.35 : 1,
+                                  fontSize: '0.85rem'
+                                }}
+                                title="Переместить выше"
+                              >
+                                ⬆️
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => moveExerciseInWorkout(exIndex, 1)}
+                                disabled={exIndex === currentWorkout.exercises.length - 1}
+                                style={{
+                                  background: '#f1f5f9',
+                                  border: '1px solid #cbd5e1',
+                                  borderRadius: '6px',
+                                  padding: '3px 7px',
+                                  cursor: exIndex === currentWorkout.exercises.length - 1 ? 'not-allowed' : 'pointer',
+                                  opacity: exIndex === currentWorkout.exercises.length - 1 ? 0.35 : 1,
+                                  fontSize: '0.85rem'
+                                }}
+                                title="Переместить ниже"
+                              >
+                                ⬇️
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => deleteExerciseFromWorkout(ex.exerciseId, ex.exerciseName)}
+                                style={{
+                                  background: '#fee2e2',
+                                  border: '1px solid #fecaca',
+                                  borderRadius: '6px',
+                                  padding: '3px 7px',
+                                  cursor: 'pointer',
+                                  color: '#dc2626',
+                                  fontSize: '0.85rem',
+                                  marginLeft: '0.25rem'
+                                }}
+                                title="Удалить упражнение из тренировки"
+                              >
+                                🗑️
+                              </button>
+                            </div>
                           </div>
                           <div style={{display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginTop: '0.25rem'}}>
                             <p style={{fontSize: '0.875rem', color: '#64748b'}}>Подходов: {ex.sets.length}</p>
@@ -2503,14 +2637,14 @@
       const [editingTemplate, setEditingTemplate] = useState(null);
       const [viewingTemplate, setViewingTemplate] = useState(null);
       const [templateName, setTemplateName] = useState('');
-      const [selectedExercises, setSelectedExercises] = useState(new Set());
+      const [selectedExercises, setSelectedExercises] = useState([]);
       const [searchQuery, setSearchQuery] = useState('');
       const [exerciseRestTimes, setExerciseRestTimes] = useState({});
 
       const openCreateModal = () => {
         setEditingTemplate(null);
         setTemplateName('');
-        setSelectedExercises(new Set());
+        setSelectedExercises([]);
         setSearchQuery('');
         setExerciseRestTimes({});
         setShowModal(true);
@@ -2519,7 +2653,7 @@
       const openEditModal = (template) => {
         setEditingTemplate(template);
         setTemplateName(template.name);
-        setSelectedExercises(new Set(template.exercises.map(e => e.exerciseId)));
+        setSelectedExercises(template.exercises.map(e => e.exerciseId));
         setSearchQuery('');
         const restTimes = {};
         template.exercises.forEach(e => {
@@ -2536,12 +2670,28 @@
         setShowViewModal(true);
       };
 
+      const moveTemplateExercise = (index, direction) => {
+        const newIndex = index + direction;
+        if (newIndex < 0 || newIndex >= selectedExercises.length) return;
+        const updated = [...selectedExercises];
+        const [moved] = updated.splice(index, 1);
+        updated.splice(newIndex, 0, moved);
+        setSelectedExercises(updated);
+      };
+
+      const removeTemplateExercise = (id) => {
+        setSelectedExercises(selectedExercises.filter(exId => exId !== id));
+        const newRestTimes = {...exerciseRestTimes};
+        delete newRestTimes[id];
+        setExerciseRestTimes(newRestTimes);
+      };
+
       const saveTemplate = () => {
         if (!templateName.trim()) {
           alert('Введите название тренировки');
           return;
         }
-        if (selectedExercises.size === 0) {
+        if (selectedExercises.length === 0) {
           alert('Выберите хотя бы одно упражнение');
           return;
         }
@@ -2549,14 +2699,14 @@
         const template = {
           id: editingTemplate?.id || Date.now(),
           name: templateName,
-          exercises: Array.from(selectedExercises).map(id => {
+          exercises: selectedExercises.map(id => {
             const ex = exercises.find(e => e.id === id);
             return { 
               exerciseId: id, 
-              exerciseName: ex.name,
+              exerciseName: ex ? ex.name : '',
               restTime: exerciseRestTimes[id] || null
             };
-          }),
+          }).filter(e => e.exerciseName),
           createdAt: editingTemplate?.createdAt || new Date().toISOString()
         };
 
@@ -2647,6 +2797,93 @@
                   <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="Введите название упражнения..." className="input" />
                 </div>
 
+                {/* Выбранные упражнения и настройка порядка выполнения */}
+                {selectedExercises.length > 0 && (
+                  <div className="form-group">
+                    <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem', flexWrap: 'wrap', gap: '0.25rem'}}>
+                      <label className="label" style={{marginBottom: 0, fontWeight: 600}}>
+                        📋 Порядок упражнений в шаблоне ({selectedExercises.length}):
+                      </label>
+                      <span style={{fontSize: '0.75rem', color: '#64748b'}}>
+                        Используйте ⬆️ ⬇️ для перемещения
+                      </span>
+                    </div>
+                    <div style={{display: 'flex', flexDirection: 'column', gap: '0.5rem', maxHeight: '180px', overflowY: 'auto', background: '#f8fafc', padding: '0.625rem', borderRadius: '8px', border: '1px solid #e2e8f0'}}>
+                      {selectedExercises.map((id, index) => {
+                        const ex = exercises.find(e => e.id === id);
+                        if (!ex) return null;
+                        return (
+                          <div key={id} style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'white', padding: '0.5rem 0.625rem', borderRadius: '6px', border: '1px solid #e2e8f0', gap: '0.5rem'}}>
+                            <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem', minWidth: 0, flex: 1}}>
+                              <span style={{fontWeight: 700, color: '#2563eb', fontSize: '0.875rem', minWidth: '20px'}}>{index + 1}.</span>
+                              <span style={{fontWeight: 500, color: '#0f172a', fontSize: '0.875rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+                                {ex.name}
+                              </span>
+                              {exerciseRestTimes[id] && (
+                                <span style={{fontSize: '0.75rem', color: '#64748b', background: '#f1f5f9', padding: '1px 5px', borderRadius: '4px', whiteSpace: 'nowrap'}}>
+                                  ⏱️ {Math.floor(exerciseRestTimes[id] / 60)}:{(exerciseRestTimes[id] % 60).toString().padStart(2, '0')}
+                                </span>
+                              )}
+                            </div>
+                            <div style={{display: 'flex', alignItems: 'center', gap: '0.25rem', flexShrink: 0}}>
+                              <button
+                                type="button"
+                                onClick={() => moveTemplateExercise(index, -1)}
+                                disabled={index === 0}
+                                style={{
+                                  background: '#f1f5f9',
+                                  border: '1px solid #cbd5e1',
+                                  borderRadius: '4px',
+                                  padding: '2px 6px',
+                                  cursor: index === 0 ? 'not-allowed' : 'pointer',
+                                  opacity: index === 0 ? 0.35 : 1,
+                                  fontSize: '0.8rem'
+                                }}
+                                title="Переместить выше"
+                              >
+                                ⬆️
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => moveTemplateExercise(index, 1)}
+                                disabled={index === selectedExercises.length - 1}
+                                style={{
+                                  background: '#f1f5f9',
+                                  border: '1px solid #cbd5e1',
+                                  borderRadius: '4px',
+                                  padding: '2px 6px',
+                                  cursor: index === selectedExercises.length - 1 ? 'not-allowed' : 'pointer',
+                                  opacity: index === selectedExercises.length - 1 ? 0.35 : 1,
+                                  fontSize: '0.8rem'
+                                }}
+                                title="Переместить ниже"
+                              >
+                                ⬇️
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setRestTimeForExercise(id)}
+                                style={{background: 'none', border: 'none', cursor: 'pointer', fontSize: '0.95rem', padding: '2px 4px'}}
+                                title="Установить время отдыха"
+                              >
+                                ⏱️
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => removeTemplateExercise(id)}
+                                style={{background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: '0.95rem', padding: '2px 4px'}}
+                                title="Удалить из шаблона"
+                              >
+                                ❌
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 <div className="form-group">
                   <label className="label">Выберите упражнения</label>
                   <div style={{maxHeight: '40vh', overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: '8px', padding: '0.75rem'}}>
@@ -2657,25 +2894,20 @@
                           <div key={ex.id} style={{display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem'}}>
                             <input
                               type="checkbox"
-                              checked={selectedExercises.has(ex.id)}
+                              checked={selectedExercises.includes(ex.id)}
                               onChange={() => {
-                                const updated = new Set(selectedExercises);
-                                if (updated.has(ex.id)) {
-                                  updated.delete(ex.id);
-                                  const newRestTimes = {...exerciseRestTimes};
-                                  delete newRestTimes[ex.id];
-                                  setExerciseRestTimes(newRestTimes);
+                                if (selectedExercises.includes(ex.id)) {
+                                  removeTemplateExercise(ex.id);
                                 } else {
-                                  updated.add(ex.id);
+                                  setSelectedExercises([...selectedExercises, ex.id]);
                                 }
-                                setSelectedExercises(updated);
                               }}
                               style={{width: '18px', height: '18px', cursor: 'pointer'}}
                             />
                             <label style={{flex: 1, cursor: 'pointer', fontSize: '0.875rem', color: '#0f172a'}}>
                               {ex.name}
                             </label>
-                            {selectedExercises.has(ex.id) && (
+                            {selectedExercises.includes(ex.id) && (
                               <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem'}}>
                                 {exerciseRestTimes[ex.id] && (
                                   <span style={{fontSize: '0.75rem', color: '#64748b'}}>
@@ -3973,9 +4205,14 @@
                     </div>
                   </div>
 
-                  <button onClick={saveUserDefaults} className="btn btn-primary" style={{alignSelf: 'flex-start', marginTop: '0.5rem'}}>
-                    💾 Сохранить значения по умолчанию
-                  </button>
+                  <div style={{display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginTop: '0.5rem'}}>
+                    <button onClick={saveUserDefaults} className="btn btn-primary">
+                      💾 Сохранить значения по умолчанию
+                    </button>
+                    <button type="button" onClick={playTimerSound} className="btn btn-secondary" title="Проверить громкость и тональность звука">
+                      🔊 Проверить звук таймера
+                    </button>
+                  </div>
                 </div>
               </div>
 

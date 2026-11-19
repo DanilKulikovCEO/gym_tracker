@@ -1,4 +1,4 @@
-const CACHE_NAME = 'gymflow-pwa-v1';
+const CACHE_NAME = 'gymflow-pwa-v2';
 
 const PRECACHE_ASSETS = [
   './',
